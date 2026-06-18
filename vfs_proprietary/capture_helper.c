@@ -23,7 +23,7 @@
 #include "capture_helper.h"
 #include "capture-helper/api.h"
 #include "vfs_proprietary.h"
-#include "drivers_api.h"
+#include <libfprint-2/tod-1/drivers_api.h>
 #include "assert.h"                   /* ASSERT_* */
 #include "trace.h"
 #include "union_of_struct_n_array.h"  /* UNION_OF_STRUCT_N_ARRAY */

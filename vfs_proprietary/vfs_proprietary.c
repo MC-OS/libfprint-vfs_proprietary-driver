@@ -22,7 +22,7 @@
 #endif
 
 #include "vfs_proprietary.h"
-#include "drivers_api.h"
+#include <libfprint-2/tod-1/drivers_api.h>
 #include "capture_helper.h"
 #include "assert.h"  /* ASSERT_* */
 #include "trace.h"
