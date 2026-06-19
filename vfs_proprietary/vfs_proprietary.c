@@ -41,7 +41,6 @@
 #define VFS_PROPRIETARY_FULLNAME     "Validity Sensors (proprietary driver)"
 #define VFS_PROPRIETARY_NAME_RAW     vfs_proprietary
 #define VFS_PROPRIETARY_NAME         G_STRINGIFY(VFS_PROPRIETARY_NAME_RAW)
-#define VFS_PROPRIETARY_STRUCT_NAME  G_PASTE(VFS_PROPRIETARY_NAME_RAW, _driver)
 
 #undef G_LOG_DOMAIN
 #define G_LOG_DOMAIN  "libfprint-" VFS_PROPRIETARY_NAME
@@ -51,12 +50,47 @@
 #undef ASSERT_GOTO_LABEL
 #define ASSERT_GOTO_LABEL cleanup
 
+#ifndef FP_IMG_DRIVER
+struct fp_driver
+{
+	gint id;
+	const gchar *name;
+	const gchar *full_name;
+	const FpIdEntry *id_table;
+	FpScanType scan_type;
+};
+
+struct fp_img_driver
+{
+	struct fp_driver driver;
+	void (*open)(FpImageDevice *imgdev);
+	void (*close)(FpImageDevice *imgdev);
+	void (*activate)(FpImageDevice *imgdev);
+	void (*deactivate)(FpImageDevice *imgdev);
+};
+
+#define FP_IMG_DRIVER(_name_, _id_table_, _open_, _close_, _activate_, _deactivate_) \
+static struct fp_img_driver G_PASTE(_name_, _driver) = { \
+	.driver = { \
+		.id = VFS_PROPRIETARY_ID, \
+		.name = G_STRINGIFY(_name_), \
+		.full_name = VFS_PROPRIETARY_FULLNAME, \
+		.id_table = _id_table_, \
+		.scan_type = FP_SCAN_TYPE_SWIPE, \
+	}, \
+	.open = _open_, \
+	.close = _close_, \
+	.activate = _activate_, \
+	.deactivate = _deactivate_, \
+};
+#endif
+
 
 /* img data callback needs to store multiple variables */
 struct img_data_cb_user_data
 {
-	struct fp_img_dev * imgdev;
-	struct fp_img * img;
+	FpImageDevice * imgdev;
+	FpImage * img;
 };
 
 
@@ -78,23 +112,17 @@ g_string_chomp (GString * const gstr)
 	return gstr;
 }
 
-__attribute__((nonnull)) static int
-vfs_proprietary_dev_open(struct fp_img_dev * const imgdev, unsigned long const driver_data)
+__attribute__((nonnull)) static void
+vfs_proprietary_dev_open(FpImageDevice *imgdev)
 {
-	int retcode = -255;
-
-	fpi_dev_set_nr_enroll_stages(FP_DEV(imgdev), VFS_PROPRIETARY_NR_ENROLL);
-
-	retcode = 0;
-	fpi_imgdev_open_complete(imgdev, retcode);
-
-	return retcode;
+	fpi_device_set_nr_enroll_stages((FpDevice *) imgdev, VFS_PROPRIETARY_NR_ENROLL);
+	fpi_image_device_open_complete(imgdev, NULL);
 }
 
 __attribute__((nonnull)) static void
-vfs_proprietary_dev_close(struct fp_img_dev * const imgdev)
+vfs_proprietary_dev_close(FpImageDevice *imgdev)
 {
-	fpi_imgdev_close_complete(imgdev);
+	fpi_image_device_close_complete(imgdev, NULL);
 }
 
 __attribute__((nonnull)) static int
@@ -102,11 +130,11 @@ ch_img_ready_callback(struct capture_helper_callback_args * args)
 {
 	TRACE();
 
-	struct fp_img_dev * imgdev = args->user_data;
+	FpImageDevice * imgdev = args->user_data;
 
 	g_assert_nonnull( imgdev );
 
-	fpi_imgdev_report_finger_status(imgdev, TRUE);
+	fpi_image_device_report_finger_status(imgdev, TRUE);
 
 	TRACE();
 
@@ -119,10 +147,12 @@ ch_img_meta_callback(struct capture_helper_callback_args * args)
 	TRACE();
 
 	int retcode = -255;
-	struct fp_img * img = NULL;
+	FpImage * img = NULL;
+	const guchar * img_data = NULL;
+	gsize img_len = 0;
 
 	struct capture_helper_img_metadata * imgmeta = args->payload.img_meta;
-	struct fp_img * * img_p = args->user_data;
+	FpImage * * img_p = args->user_data;
 
 	g_assert_nonnull( imgmeta );
 	g_assert_nonnull( img_p );
@@ -135,17 +165,18 @@ ch_img_meta_callback(struct capture_helper_callback_args * args)
 		-1, "Invalid img returned, w=%zu, h=%zu, len=%zu", imgmeta->w, imgmeta->h, imgmeta->len
 	);
 
-	img = fpi_img_new(imgmeta->len);
+	img = fp_image_new(imgmeta->w, imgmeta->h);
 	ASSERT_PRINTF(img != NULL , -ENOMEM, "Could not get new fpi img");
 
 	img->width = imgmeta->w;
 	img->height = imgmeta->h;
-	img->flags = FP_IMG_COLORS_INVERTED | FP_IMG_V_FLIPPED;
+	img->flags = FPI_IMAGE_COLORS_INVERTED | FPI_IMAGE_V_FLIPPED;
+	img_data = fp_image_get_data(img, &img_len);
 
 	fp_dbg("img: dimensions=%dx%d, length=%zu, flags=%" PRIu16,
-			img->width, img->height, img->length, img->flags);
+			img->width, img->height, img_len, img->flags);
 
-	imgmeta->data = img->data;
+	imgmeta->data = (unsigned char *) img_data;
 	*img_p = img;
 	img = NULL;
 
@@ -154,7 +185,7 @@ ch_img_meta_callback(struct capture_helper_callback_args * args)
 	retcode = 0;
 cleanup:
 	if (G_UNLIKELY( img != NULL ))
-		fp_img_free(img);
+		g_object_unref(img);
 
 	TRACE();
 
@@ -168,23 +199,21 @@ ch_img_data_callback(struct capture_helper_callback_args * args)
 
 	struct img_data_cb_user_data * user_data = args->user_data;
 
-	fpi_imgdev_image_captured(user_data->imgdev, user_data->img);
+	fpi_image_device_image_captured(user_data->imgdev, user_data->img);
 	user_data->img = NULL;
 
 	/* NOTE: finger off is expected only after submitting image... */
-	fpi_imgdev_report_finger_status(user_data->imgdev, FALSE);
+	fpi_image_device_report_finger_status(user_data->imgdev, FALSE);
 
 	TRACE();
 
 	return 0;
 }
 
-__attribute__((nonnull)) static int
-vfs_proprietary_dev_activate(
-	struct fp_img_dev    * const imgdev,
-	enum fp_imgdev_state   const state)
+__attribute__((nonnull)) static void
+vfs_proprietary_dev_activate(FpImageDevice * const imgdev)
 {
-	fp_dbg("dev_activate(%d)", state);
+	fp_dbg("dev_activate()");
 
 	int interr, retcode = -255;
 
@@ -192,7 +221,10 @@ vfs_proprietary_dev_activate(
 
 	retcode = interr = capture_helper_spawn(ch);
 	/* IMG_ACQUIRE_STATE_ACTIVATING => IMG_ACQUIRE_STATE_AWAIT_FINGER_ON */
-	fpi_imgdev_activate_complete(imgdev, retcode);
+	fpi_image_device_activate_complete(
+		imgdev,
+		retcode == 0 ? NULL : g_error_new_literal(g_quark_from_static_string("libfprint"), -retcode, "Failed to spawn capture-helper")
+	);
 	ASSERT_PRINTF( interr == 0 , retcode, "Failed to spawn capture-helper");
 
 	struct img_data_cb_user_data img_data_cb_user_data = { .imgdev = imgdev, .img = NULL };
@@ -227,42 +259,31 @@ cleanup:
 		fp_dbg("dev_activate(): %s", strerror(-retcode));
 
 	TRACE();
-
-	return retcode;
 }
 
 __attribute__((nonnull)) static void
-vfs_proprietary_dev_deactivate(struct fp_img_dev * imgdev)
+vfs_proprietary_dev_deactivate(FpImageDevice *imgdev)
 {
-	fpi_imgdev_deactivate_complete(imgdev);
+	fpi_image_device_deactivate_complete(imgdev, NULL);
 }
 
 
-static struct usb_id const
+static const FpIdEntry
 id_table[] = {
 // 	{ .vendor = VALIDITY_VENDOR_ID, .product = VALIDITY_PRODUCT_ID_301,  },  // FOSS implementation exists
-	{ .vendor = VALIDITY_VENDOR_ID, .product = VALIDITY_PRODUCT_ID_451,  },
+	{ .vid = VALIDITY_VENDOR_ID, .pid = VALIDITY_PRODUCT_ID_451,  },
 // 	{ .vendor = VALIDITY_VENDOR_ID, .product = VALIDITY_PRODUCT_ID_5111, },  // FOSS implementation exists
 // 	{ .vendor = VALIDITY_VENDOR_ID, .product = VALIDITY_PRODUCT_ID_5011, },  // FOSS implementation exists
-	{ .vendor = VALIDITY_VENDOR_ID, .product = VALIDITY_PRODUCT_ID_471,  },
+	{ .vid = VALIDITY_VENDOR_ID, .pid = VALIDITY_PRODUCT_ID_471,  },
 // 	{ .vendor = VALIDITY_VENDOR_ID, .product = VALIDITY_PRODUCT_ID_5131, },  // FOSS implementation exists
-	{ .vendor = VALIDITY_VENDOR_ID, .product = VALIDITY_PRODUCT_ID_491,  },
-	{ .vendor = VALIDITY_VENDOR_ID, .product = VALIDITY_PRODUCT_ID_495,  },
+	{ .vid = VALIDITY_VENDOR_ID, .pid = VALIDITY_PRODUCT_ID_491,  },
+	{ .vid = VALIDITY_VENDOR_ID, .pid = VALIDITY_PRODUCT_ID_495,  },
 	{ 0 },
 };
 
-struct fp_img_driver
-VFS_PROPRIETARY_STRUCT_NAME = {
-	.driver = {
-		.id = VFS_PROPRIETARY_ID,
-		.name = VFS_PROPRIETARY_NAME,
-		.full_name = VFS_PROPRIETARY_FULLNAME,
-		.id_table = id_table,
-		.scan_type = FP_SCAN_TYPE_SWIPE,
-	},
-
-	.open = vfs_proprietary_dev_open,
-	.close = vfs_proprietary_dev_close,
-	.activate = vfs_proprietary_dev_activate,
-	.deactivate = vfs_proprietary_dev_deactivate,
-};
+FP_IMG_DRIVER(vfs_proprietary,
+	id_table,
+	vfs_proprietary_dev_open,
+	vfs_proprietary_dev_close,
+	vfs_proprietary_dev_activate,
+	vfs_proprietary_dev_deactivate);
